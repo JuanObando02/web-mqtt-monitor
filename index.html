@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor MQTT</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2230; --muted:#6b7385; --line:#e3e6ec; --ok:#1a9d57; --bad:#d6453d; --accent:#2f6fed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f131a; --card:#171c26; --text:#e6e9f0; --muted:#8a93a6; --line:#262d3b; --ok:#3ecf8e; --bad:#ef6b63; --accent:#6c9bff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 16px; display:flex; align-items:center; gap:10px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); }
+  .dot.on { background:var(--ok); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  input { flex:1 1 220px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  button { padding:8px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  label { font-size:12px; color:var(--muted); display:block; margin:0 0 4px; }
+  .field { flex:1 1 220px; }
+  .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; }
+  .metric { border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .metric b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .metric span { font-size:12px; color:var(--muted); }
+  #log { max-height:300px; overflow:auto; font:12px/1.6 ui-monospace, Consolas, monospace; }
+  #log div { border-bottom:1px solid var(--line); padding:3px 0; word-break:break-all; }
+  #log time { color:var(--muted); }
+  #log em { color:var(--accent); font-style:normal; }
+  #err { color:var(--bad); font-size:13px; margin-top:8px; min-height:1em; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="dot" id="dot"></span> Monitor MQTT <small id="state" style="font-weight:400;color:var(--muted)">desconectado</small></h1>
+
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="url">Broker (WebSocket)</label><input id="url"></div>
+      <div class="field"><label for="topic">Topic (admite # y +)</label><input id="topic"></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button id="go">Conectar</button></div>
+    <div id="err"></div>
+  </div>
+
+  <div class="card">
+    <div id="dev" style="margin-bottom:10px;color:var(--muted)">Estado del dispositivo: <b id="devState">sin datos</b></div>
+    <div class="metrics">
+      <div class="metric"><b id="m_contador">-</b><span>mensaje #</span></div>
+      <div class="metric"><b id="m_temp_chip">-</b><span>temp. chip (°C)</span></div>
+      <div class="metric"><b id="m_rssi">-</b><span>WiFi RSSI (dBm)</span></div>
+      <div class="metric"><b id="m_uptime_s">-</b><span>uptime (s)</span></div>
+      <div class="metric"><b id="m_heap_libre">-</b><span>heap libre (B)</span></div>
+    </div>
+  </div>
+
+  <div class="card"><label>Mensajes recibidos</label><div id="log"></div></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+<script>
+  // Cambia estos valores por defecto segun tu despliegue
+  const DEFAULT_URL = "ws://o00soo4kcww0kc0oco4gwo4k.62.146.179.197.sslip.io";
+  const DEFAULT_TOPIC = "iot/clase/grupo1/#";
+
+  const $ = id => document.getElementById(id);
+  const saved = (() => { try { return JSON.parse(localStorage.getItem("mqtt-cfg")) || {}; } catch { return {}; } })();
+  $("url").value = saved.url || DEFAULT_URL;
+  $("topic").value = saved.topic || DEFAULT_TOPIC;
+
+  let client;
+  function setState(on, text) {
+    $("dot").classList.toggle("on", on);
+    $("state").textContent = text;
+  }
+
+  function addLog(topic, msg) {
+    const d = document.createElement("div");
+    const t = new Date().toLocaleTimeString();
+    d.innerHTML = `<time>${t}</time> <em></em> <span></span>`;
+    d.querySelector("em").textContent = topic;
+    d.querySelector("span").textContent = msg;
+    $("log").prepend(d);
+    while ($("log").children.length > 100) $("log").lastChild.remove();
+  }
+
+  function onMessage(topic, payload) {
+    const msg = payload.toString();
+    addLog(topic, msg);
+    if (topic.endsWith("/estado")) { $("devState").textContent = msg; return; }
+    try {
+      const data = JSON.parse(msg);
+      for (const k of ["contador", "temp_chip", "rssi", "uptime_s", "heap_libre"]) {
+        if (k in data) $("m_" + k).textContent = typeof data[k] === "number" ? Math.round(data[k] * 10) / 10 : data[k];
+      }
+    } catch { /* mensaje no JSON: solo se muestra en el log */ }
+  }
+
+  function connect() {
+    $("err").textContent = "";
+    if (client) client.end(true);
+    const url = $("url").value.trim(), topic = $("topic").value.trim();
+    try { localStorage.setItem("mqtt-cfg", JSON.stringify({ url, topic })); } catch {}
+    setState(false, "conectando...");
+    client = mqtt.connect(url, { reconnectPeriod: 3000, clientId: "web-" + Math.random().toString(16).slice(2, 8) });
+    client.on("connect", () => {
+      setState(true, "conectado");
+      client.subscribe(topic, err => { if (err) $("err").textContent = "Error al suscribir: " + err.message; });
+    });
+    client.on("reconnect", () => setState(false, "reconectando..."));
+    client.on("close", () => setState(false, "desconectado"));
+    client.on("error", e => { $("err").textContent = e.message; });
+    client.on("message", onMessage);
+  }
+
+  $("go").addEventListener("click", connect);
+  connect();
+</script>
+</body>
+</html>
